@@ -71,3 +71,22 @@ For shops with no storefront photo, the app can show a Google Street View image 
    30° left or right, or reject the view.
 
 Without a key, Street View is skipped and the app works as before.
+
+## Holiday info
+
+The **Holiday** page lists upcoming holiday events and Small Business Weekend deals from `data/holiday.csv`.
+To add one, add a row with these columns:
+
+| column | what goes in it |
+|---|---|
+| `kind` | `event` (shown under "Coming up") or `deal` (shown under "Small Business Weekend deals") |
+| `title` | short name, e.g. `Light Up Lakewood` |
+| `business` | the shop's name exactly as in `businesses.csv` (or blank). A matching shop gets a 🎄 line on its card, and deals link to its card |
+| `start`, `end` | dates as `YYYY-MM-DD` (leave `end` blank for a one-day event) |
+| `time` | free text, e.g. `4-8pm` or `Fri 6-10pm, Sat 10am-6pm` |
+| `place`, `address` | where it is; the address becomes a Google Maps link |
+| `details` | one or two sentences |
+| `source` | link to where the info came from |
+
+Rows hide themselves once their end date has passed (Lakewood time), so there's no need to delete old ones.
+Anything happening today or this weekend gets a light highlight.

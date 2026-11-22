@@ -12,9 +12,11 @@ import re
 import threading
 import urllib.parse
 import urllib.request
+import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote_plus, urlparse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pydeck as pdk
@@ -368,6 +370,72 @@ setTimeout(() => document.querySelector('%s')?.scrollIntoView({block: "start"}),
 </script>"""
 
 
+# ---- Holiday events and deals (data/holiday.csv). Rows hide themselves once their end date has passed.
+HOLIDAY_FILE = Path(__file__).parent / "data" / "holiday.csv"
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+
+@st.cache_data
+def load_holiday(mtime: float) -> pd.DataFrame:
+    if not HOLIDAY_FILE.exists():
+        return pd.DataFrame(columns=["kind", "title", "business", "start", "end", "time", "place", "address",
+                                     "details", "source"])
+    h = pd.read_csv(HOLIDAY_FILE, dtype=str).fillna("")
+    h["start_d"] = pd.to_datetime(h["start"], errors="coerce").dt.date
+    h["end_d"] = pd.to_datetime(h["end"].where(h["end"] != "", h["start"]), errors="coerce").dt.date
+    return h.dropna(subset=["start_d", "end_d"]).sort_values(["start_d", "end_d", "title"]).reset_index(drop=True)
+
+
+def today_local() -> dt.date:
+    return dt.datetime.now(LOCAL_TZ).date()
+
+
+def holiday_now() -> pd.DataFrame:
+    """Rows that haven't ended yet (Lakewood time)."""
+    h = load_holiday(HOLIDAY_FILE.stat().st_mtime if HOLIDAY_FILE.exists() else 0)
+    return h[h["end_d"] >= today_local()]
+
+
+def _md(text: str) -> str:
+    """Plain text for st.markdown: keep "$10" from turning into math."""
+    return text.replace("$", "\\$")
+
+
+def _day(d: dt.date) -> str:
+    return f"{d:%b} {d.day}"
+
+
+def date_chip(start: dt.date, end: dt.date, today: dt.date) -> str:
+    if start < today:
+        return f"Now through {_day(end)}" if end > today else "Today"
+    if start == end:
+        return "Today" if start == today else f"{start:%a} {_day(start)}"
+    if start.month == end.month and start.year == end.year:
+        return f"{_day(start)}-{end.day}"
+    return f"{_day(start)} - {_day(end)}" + (f", {end.year}" if end.year != start.year else "")
+
+
+def is_soon(start: dt.date, end: dt.date, today: dt.date) -> bool:
+    """Happening today or this weekend (the coming Sat-Sun, or the current one if it's the weekend)."""
+    sat = today + dt.timedelta(days=(5 - today.weekday()) % 7) if today.weekday() != 6 else today - dt.timedelta(1)
+    return (start <= today <= end) or (start <= sat + dt.timedelta(1) and end >= sat)
+
+
+def _short(text: str, n: int = 90) -> str:
+    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+
+
+def holiday_lines(name: str, full: bool):
+    """🎄 lines for one business on its card: the soonest one on a small card, all of them on the full card."""
+    h = holiday_now()
+    mine = h[h["business"] == name]
+    today = today_local()
+    for _, r in (mine if full else mine.head(1)).iterrows():
+        details = r["details"] if full else _short(r["details"])
+        st.markdown(f"🎄 **{_md(r['title'])}**" + (f": {_md(details)}" if details else "")
+                    + f" · _{date_chip(r['start_d'], r['end_d'], today)}_")
+
+
 def shop_info(row, extra_cols, *, full=False):
     """The text part of a card. full=True adds everything (sources, notes, last checked)."""
     if full:
@@ -380,6 +448,7 @@ def shop_info(row, extra_cols, *, full=False):
     elif row.get("status") == "online only":
         badge += "  🛒 _online only_"
     st.markdown(badge)
+    holiday_lines(row["name"], full)
     if row["gift_ideas"]:
         st.markdown(f"🎁 {row['gift_ideas']}")
     if row["address"]:
@@ -460,6 +529,9 @@ def directory(df, *, title, caption, header, placeholder, noun, key):
         view = view[view["status"] != "online only"]
 
     extra_cols = [c for c in df.columns if c not in CORE and c not in HIDDEN_IN_CARD and c != "street"]
+    jump = st.session_state.pop(f"goto_{key}", None)  # "open this shop" from the Holiday page
+    if jump:
+        st.query_params["shop"] = jump
     opened = df[df["name"].map(slug) == st.query_params.get("shop", "")]
     if not opened.empty:  # one card expanded to fill the page, instead of the list
         full_card(opened.iloc[0], extra_cols, noun)
@@ -539,6 +611,75 @@ def dining_page():
               title="🍽️ Eat & Drink Local",
               caption="Locally owned restaurants, bars and cafes in Lakewood. Many sell gift cards, which make easy presents.",
               header="Find a place", placeholder="e.g. pizza, sushi, brunch", noun="place", key="dining")
+
+
+HOLIDAY_CSS = """<style>
+[class*="st-key-hol-soon-"]{background:rgba(192,57,43,.07);border-radius:.5rem}
+.hol-chip{display:inline-block;background:#c0392b;color:#fff;border-radius:999px;padding:1px 10px;
+  font-size:.82rem;font-weight:600;margin-right:6px;white-space:nowrap}
+</style>"""
+
+
+def _maps_link(place: str, address: str) -> str:
+    if not address:
+        return _md(place)
+    where = address if "Cleveland" in address else f"{address}, Lakewood, OH"
+    url = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(where)
+    label = address if place in ("", address) else f"{place}, {address}"
+    return f"[{_md(label)}]({url})"
+
+
+def _open_shop_from(page_key: str, sl: str):
+    st.session_state[f"goto_{page_key}"] = sl
+    st.switch_page(PAGES[page_key])
+
+
+def holiday_page():
+    st.title("🎄 Holidays in Lakewood")
+    st.caption("Events and Small Business Weekend deals, from the linked sources. Details can change, "
+               "so check with each shop before you go.")
+    st.html(HOLIDAY_CSS)
+    h, today = holiday_now(), today_local()
+
+    st.subheader("Coming up")
+    events = h[h["kind"] == "event"]
+    if events.empty:
+        st.info("No upcoming holiday events in the list right now.")
+    for i, r in events.iterrows():
+        soon = is_soon(r["start_d"], r["end_d"], today)
+        with st.container(border=True, key=f"hol-{'soon' if soon else 'ev'}-{i}"):
+            st.markdown(f"<span class='hol-chip'>{html.escape(date_chip(r['start_d'], r['end_d'], today))}</span> "
+                        f"**{html.escape(r['title']).replace('$', '&#36;')}**", unsafe_allow_html=True)
+            where = " · ".join(x for x in (f"🕒 {_md(r['time'])}" if r["time"] else "",
+                                           f"📍 {_maps_link(r['place'], r['address'])}" if r["place"] or r["address"] else "") if x)
+            if where:
+                st.markdown(where)
+            if r["details"]:
+                st.markdown(_md(r["details"]))
+            st.caption(f"[Source]({r['source']})")
+
+    st.subheader("Small Business Weekend deals")
+    st.caption("Some of these shops aren't in the catalog yet.")
+    deals = h[h["kind"] == "deal"]
+    if deals.empty:
+        st.info("No current deals in the list.")
+    known = dict(zip(ALL["name"], ALL["category"]))
+    for i, r in deals.iterrows():
+        soon = is_soon(r["start_d"], r["end_d"], today)
+        with st.container(border=True, key=f"hol-{'soon' if soon else 'deal'}-{i}"):
+            st.markdown(f"<span class='hol-chip'>{html.escape(date_chip(r['start_d'], r['end_d'], today))}</span> "
+                        f"<b>{html.escape(r['business'] or r['place'])}</b>", unsafe_allow_html=True)
+            if r["business"] in known:
+                page_key = "dining" if known[r["business"]] in DINING else "shops"
+                if st.button(f"See {r['business']}'s card", key=f"hol-open-{i}", type="tertiary",
+                             icon=":material/storefront:"):
+                    _open_shop_from(page_key, slug(r["business"]))
+            st.markdown(f"**{_md(r['title'])}:** {_md(r['details'])}")
+            extra = " · ".join(x for x in (f"🕒 {_md(r['time'])}" if r["time"] else "",
+                                           f"📍 {_maps_link('', r['address'])}" if r["address"] else "") if x)
+            if extra:
+                st.markdown(extra)
+            st.caption(f"[Source]({r['source']})")
 
 
 def _rank(r) -> int:
@@ -723,10 +864,12 @@ def review_page():
 # On Streamlit Community Cloud the app's files are read-only and reset on restart, so the
 # Review photos page (which edits data/*.csv) is only offered when running on your own computer.
 ON_CLOUD = os.path.isdir("/mount/src")
-pages = [
-    st.Page(shops_page, title="Shops", icon="🎁", url_path="shops", default=True),
-    st.Page(dining_page, title="Eat & Drink", icon="🍽️", url_path="eat-drink"),
-]
+PAGES = {
+    "shops": st.Page(shops_page, title="Shops", icon="🎁", url_path="shops", default=True),
+    "dining": st.Page(dining_page, title="Eat & Drink", icon="🍽️", url_path="eat-drink"),
+    "holiday": st.Page(holiday_page, title="Holiday", icon="🎄", url_path="holiday"),
+}
+pages = list(PAGES.values())
 if not ON_CLOUD:
     pages.append(st.Page(review_page, title="Review photos", icon="🖼️", url_path="review-photos"))
 st.navigation(pages).run()
