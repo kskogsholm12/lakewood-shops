@@ -1,0 +1,9 @@
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+data/photos.backup-*.csv
+*.log
+nohup.out
+.DS_Store
+# local review screenshots (they contain shops' photos, which are only linked, never copied)
+review/
