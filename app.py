@@ -252,17 +252,19 @@ SLIDESHOW_JS = """<script>
   const root = document.getElementById("%s");
   if (!root || root.dataset.ready) return;
   root.dataset.ready = 1;
-  const track = root.querySelector(".ss-track");
-  const n = track.children.length;
-  const marks = [...root.querySelectorAll(".ss-dot"), ...(root.parentElement.querySelectorAll(".ss-thumbs img"))];
-  const idx = () => Math.round(track.scrollLeft / track.clientWidth);
-  const go = i => track.scrollTo({left: ((i + n) %% n) * track.clientWidth});
-  const paint = () => { const i = idx(); marks.forEach(m => m.classList.toggle("on", +m.dataset.i === i)); };
-  root.querySelector(".ss-prev")?.addEventListener("click", e => { e.stopPropagation(); go(idx() - 1); });
-  root.querySelector(".ss-next")?.addEventListener("click", e => { e.stopPropagation(); go(idx() + 1); });
-  marks.forEach(m => m.addEventListener("click", e => { e.stopPropagation(); go(+m.dataset.i); }));
-  track.addEventListener("scroll", () => requestAnimationFrame(paint), {passive: true});
-  paint();
+  const track = root.querySelector(".ss-track");  // missing when a shop has no photo yet
+  if (track) {
+    const n = track.children.length;
+    const marks = [...root.querySelectorAll(".ss-dot"), ...(root.parentElement.querySelectorAll(".ss-thumbs img"))];
+    const idx = () => Math.round(track.scrollLeft / track.clientWidth);
+    const go = i => track.scrollTo({left: ((i + n) %% n) * track.clientWidth});
+    const paint = () => { const i = idx(); marks.forEach(m => m.classList.toggle("on", +m.dataset.i === i)); };
+    root.querySelector(".ss-prev")?.addEventListener("click", e => { e.stopPropagation(); go(idx() - 1); });
+    root.querySelector(".ss-next")?.addEventListener("click", e => { e.stopPropagation(); go(idx() + 1); });
+    marks.forEach(m => m.addEventListener("click", e => { e.stopPropagation(); go(+m.dataset.i); }));
+    track.addEventListener("scroll", () => requestAnimationFrame(paint), {passive: true});
+    paint();
+  }
   %s
 })();
 </script>"""
