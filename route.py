@@ -2,6 +2,7 @@
 in a sensible walking order. No Streamlit in here, so it is easy to test on its own.
 
 Hours are free text in data/businesses.csv, e.g. "Tue-Sat 12-6pm; Sun 12-5pm; Mon closed".
+Split openings on one day use "&": "Mon-Sat 11:30am-2:30pm & 5-9:30pm".
 parse_hours() understands that style. Anything it can't read is treated as "hours unknown".
 """
 import datetime as dt
@@ -82,11 +83,11 @@ def parse_hours(text: str):
         seen = True
         if "closed" in low or ("appointment" in low and not text.lower().startswith("by appointment")):
             continue
-        rng = _RANGE.search(seg[dm.end():]) or _RANGE.search(seg)
-        if not rng:
-            continue
-        for d in days:
-            week[d].append(_range(rng))
+        # "Mon-Sat 11:30am-2:30pm & 5-9:30pm" gives a day two separate openings
+        rngs = list(_RANGE.finditer(seg[dm.end():])) or list(_RANGE.finditer(seg))
+        for rng in rngs:
+            for d in days:
+                week[d].append(_range(rng))
     if not seen:
         return None
     if text.lower().startswith("by appointment"):

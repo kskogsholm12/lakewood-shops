@@ -29,7 +29,7 @@ import route as rt
 
 DATA_FILE = Path(__file__).parent / "data" / "businesses.csv"
 # Columns with special handling; any other column is shown as-is.
-CORE = ["name", "category", "address", "hours", "gift_ideas", "website", "phone", "instagram"]
+CORE = ["name", "category", "description", "address", "hours", "holiday_hours", "gift_ideas", "website", "phone", "instagram"]
 HIDDEN_IN_CARD = {"name", "source_urls", "status", "last_checked", "photo_urls"}
 PHOTOS_FILE = Path(__file__).parent / "data" / "photos.csv"  # filled by fetch_photos.py
 MY_PHOTOS = Path(__file__).parent / "data" / "photos"  # your own: data/photos/<shop-slug>/*.jpg
@@ -457,6 +457,8 @@ def shop_info(row, extra_cols, *, full=False):
     elif row.get("status") == "online only":
         badge += "  🛒 _online only_"
     st.markdown(badge)
+    if row["description"]:
+        st.markdown(f"_{row['description']}_")
     holiday_lines(row["name"], full)
     if row["gift_ideas"]:
         st.markdown(f"🎁 {row['gift_ideas']}")
@@ -464,6 +466,8 @@ def shop_info(row, extra_cols, *, full=False):
         maps = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{row['name']} {row['address']}")
         st.markdown(f"📍 [{row['address']}]({maps})")
     st.markdown(f"🕒 {row['hours'] or '_Hours not listed yet, call or check online_'}")
+    if row["holiday_hours"]:
+        st.markdown(f"🎄 **Holiday hours:** {row['holiday_hours']}")
     if row["phone"]:
         tel = re.sub(r"[^0-9+]", "", row["phone"])
         st.markdown(f"📞 [{row['phone']}](tel:{tel})" if full else f"📞 {row['phone']}")
