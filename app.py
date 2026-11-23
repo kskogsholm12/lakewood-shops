@@ -8,6 +8,7 @@ import base64
 import csv
 import html
 import os
+import random
 import re
 import threading
 import urllib.parse
@@ -24,6 +25,7 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 from geocode import geocode_all
+import route as rt
 
 DATA_FILE = Path(__file__).parent / "data" / "businesses.csv"
 # Columns with special handling; any other column is shown as-is.
@@ -311,9 +313,8 @@ setTimeout(run, 200); setTimeout(run, 1200);
 </script>""", height=0)
 
 
-def show_photos(row, *, big=False, uid=""):
-    """Slideshow of a shop's photos (storefront first) with its logo as a round badge.
-    Arrows and dots on every screen, swipe on phones. big=True is the full-screen card version."""
+def slides_for(row):
+    """(slides, logo) for one shop: the photos a slideshow shows, best first, and its logo (or None)."""
     pics = photos_for(row)
     logo = next((p for p in pics if p["type"] == "logo"), None)
     # Real storefront photos first (the "main" one leading), then the Street View storefront,
@@ -321,7 +322,13 @@ def show_photos(row, *, big=False, uid=""):
     def order(p):
         group = 0 if p["type"] == "storefront" and not p.get("streetview") else 1 if p.get("streetview") else 2
         return group, not p["main"], HERO_ORDER.index(p["type"])
-    slides = sorted((p for p in pics if p["type"] in HERO_ORDER), key=order)
+    return sorted((p for p in pics if p["type"] in HERO_ORDER), key=order), logo
+
+
+def show_photos(row, *, big=False, uid=""):
+    """Slideshow of a shop's photos (storefront first) with its logo as a round badge.
+    Arrows and dots on every screen, swipe on phones. big=True is the full-screen card version."""
+    slides, logo = slides_for(row)
     uid = uid or "ss-" + slug(row["name"]) + ("-big" if big else "")
     height = "min(460px, 66vw)" if big else "200px"
     badge = f"<img class='ss-badge' src='{logo['src']}' alt='logo'>" if logo else ""
@@ -484,6 +491,7 @@ def full_card(row, extra_cols, noun):
         with right:
             shop_info(row, extra_cols, full=True)
             if row["address"]:
+                route_button(row["name"], "rt-add-full")
                 lat, lon = geocode_all([row["address"]]).get(row["address"], ("", ""))
                 if lat != "":
                     st.pydeck_chart(pdk.Deck(
@@ -503,6 +511,7 @@ def full_card(row, extra_cols, noun):
 def directory(df, *, title, caption, header, placeholder, noun, key):
     st.title(title)
     st.caption(caption)
+    route_banner()
 
     with st.sidebar:
         st.header(header)
@@ -554,8 +563,16 @@ def directory(df, *, title, caption, header, placeholder, noun, key):
                 with col, st.container(border=True, key=f"card-{key}-{sl}"):
                     show_photos(row)
                     shop_info(row, extra_cols)
-                    st.button("See more", key=f"open-{key}-{sl}", icon=":material/open_in_full:", on_click=open_shop, args=(sl,),
-                              width="stretch")
+                    if row["address"]:
+                        b1, b2 = st.columns(2, gap="small")
+                        with b1:
+                            st.button("See more", key=f"open-{key}-{sl}", icon=":material/open_in_full:",
+                                      on_click=open_shop, args=(sl,), width="stretch")
+                        with b2:
+                            route_button(row["name"], f"rt-add-{key}-{sl}")
+                    else:  # online only: nothing to walk to
+                        st.button("See more", key=f"open-{key}-{sl}", icon=":material/open_in_full:",
+                                  on_click=open_shop, args=(sl,), width="stretch")
 
     with tab_map:
         with st.spinner("Finding shops on the map (first time only)..."):
@@ -682,6 +699,461 @@ def holiday_page():
             if extra:
                 st.markdown(extra)
             st.caption(f"[Source]({r['source']})")
+
+
+# ---- Plan a route. The route is a list of shop names in st.session_state["route"], kept in the
+# address bar (?stops=slug,slug) while you're on the route page, so a bookmark or a reload keeps it.
+NOT_BROWSING = DINING | {"Salon & Spa"}           # left out of picked routes unless you ask for them
+FOOD_STOPS = DINING | {"Bakery", "Food & Treats"}  # where the "coffee, treat or lunch stop" comes from
+
+
+def route_list() -> list:
+    return st.session_state.setdefault("route", [])
+
+
+def _route_changed(new: list, *, keep_undo=True):
+    if keep_undo:
+        st.session_state["route_prev"] = list(route_list())
+    st.session_state["route"] = new
+
+
+def toggle_route(name: str):
+    r = route_list()
+    if name in r:
+        r.remove(name)
+    else:
+        r.append(name)
+        st.session_state.setdefault("route_new", []).append(name)  # put in walking order on the route page
+
+
+def route_button(name: str, key: str):
+    on = name in route_list()
+    st.button("On your route" if on else "Add to route", key=key, width="stretch", on_click=toggle_route, args=(name,),
+              icon=":material/check_circle:" if on else ":material/add_location_alt:", type="primary" if on else "secondary")
+
+
+def route_banner():
+    n = len(route_list())
+    label = (f"Your route: {n} stop{'s' if n != 1 else ''}. See it and walk it" if n
+             else "Not sure where to start? Plan a walking route of shops to explore")
+    st.page_link(PAGES["route"], label=label, icon=":material/route:")
+
+
+def restore_route():
+    if "route" not in st.session_state and st.query_params.get("stops"):
+        by_slug = {slug(n): n for n in ALL["name"]}
+        st.session_state["route"] = [by_slug[s] for s in st.query_params["stops"].split(",") if s in by_slug]
+
+
+def _coords(names) -> dict:
+    rows = ALL.set_index("name")
+    addrs = {n: rows.at[n, "address"] for n in names if n in rows.index and rows.at[n, "address"]}
+    found = geocode_all(list(addrs.values()))
+    out = {}
+    for n, a in addrs.items():
+        lat, lon = found.get(a, ("", ""))
+        if lat != "":
+            out[n] = (float(lat), float(lon))
+    return out
+
+
+def _clock(t: dt.datetime) -> str:
+    """1:30pm, 11am"""
+    return f"{t.hour % 12 or 12}{':%02d' % t.minute if t.minute else ''}{'am' if t.hour < 12 else 'pm'}"
+
+
+def _when() -> tuple:
+    """The day and time chosen on the route page, as (datetime in Lakewood, starting-now?)."""
+    now = dt.datetime.now(LOCAL_TZ).replace(second=0, microsecond=0, tzinfo=None)
+    offset = st.session_state.get("rt_day")
+    offset = 0 if offset is None else offset
+    mins = st.session_state.get("rt_time", 11 * 60)
+    day = now.date() + dt.timedelta(days=offset)
+    when = dt.datetime.combine(day, dt.time(mins // 60, mins % 60))
+    if when < now:
+        return now, True
+    return when, False
+
+
+ROUTE_CSS = """<style>
+.rt-head{display:flex;align-items:center;gap:12px}
+.rt-num{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;border-radius:50%;
+  background:#c0392b;color:#fff;font-weight:700;flex:0 0 auto;font-size:15px}
+.rt-thumb{width:64px;height:64px;border-radius:8px;object-fit:cover;flex:0 0 auto;background:#f1ede6;
+  display:flex;align-items:center;justify-content:center;font-size:30px}
+.rt-name{font-weight:700;font-size:1.1rem;line-height:1.25}
+.rt-cat{color:#6b6257;font-size:.85rem}
+.rt-walk{color:#6b6257;font-size:.88rem;margin:-4px 0 -4px 14px;border-left:3px dotted #c0392b;padding:4px 0 4px 14px}
+.rt-sum{font-size:1.05rem}
+.st-key-rt-route-top{scroll-margin-top:60px}
+.st-key-rt_day [role="radiogroup"]{flex-wrap:wrap!important;overflow:visible!important;row-gap:6px}
+/* Desktop: the map column stays in view while you scroll the stops. */
+@media (min-width:641px) and (min-height:820px){
+  [data-testid="stColumn"]:has(.st-key-rt-left){position:sticky;top:4rem;align-self:flex-start}}
+</style>"""
+
+
+def _thumb(row) -> str:
+    slides, logo = slides_for(row)
+    pic = slides[0] if slides else logo
+    if pic:
+        return f"<img class='rt-thumb' src='{html.escape(pic['src'], quote=True)}' alt=''>"
+    return f"<div class='rt-thumb'>{CATEGORY_EMOJI.get(row['category'], '🏬')}</div>"
+
+
+def _stop_head(row, num) -> str:
+    badge = f"<span class='rt-num'>{num}</span>" if num else ""
+    return (f"<div class='rt-head'>{badge}{_thumb(row)}<div><div class='rt-name'>{html.escape(row['name'])}</div>"
+            f"<div class='rt-cat'>{html.escape(row['category'])}</div></div></div>")
+
+
+def _open_line(row, when: dt.datetime) -> str:
+    s = rt.status_at(row["hours"], when)
+    icon = {"open": "✅", "closed": "⚠️", "unknown": "❔", "appointment": "📅"}[s["state"]]
+    return f"{icon} {s['label']}"
+
+
+def _pool(when, *, cats, area, only_open, known_only, categories_ok):
+    """Shops you could walk to and browse at `when`, as [{"name", "category", "pt"}]."""
+    pts = _coords(ALL["name"])
+    out = []
+    for _, r in ALL.iterrows():
+        if r["name"] not in pts or r["status"] == "online only" or not categories_ok(r["category"]):
+            continue
+        if cats and r["category"] not in cats:
+            continue
+        if area != "Anywhere" and r["street"] != area:
+            continue
+        ok = rt.open_for_visit(r["hours"], when, window_min=45)
+        if (only_open and ok == "no") or (known_only and ok != "yes"):
+            continue
+        out.append({"name": r["name"], "category": r["category"], "pt": pts[r["name"]], "open": ok})
+    return out
+
+
+def build_route(surprise: bool):
+    when, _ = _when()
+    cats = st.session_state.get("rt_cats") or []
+    area = st.session_state.get("rt_area") or "Anywhere"
+    only_open = st.session_state.get("rt_open", True)
+    known_only = st.session_state.get("rt_known", False)
+    n = st.session_state.get("rt_n", 6)
+    want_food = st.session_state.get("rt_food", True)
+    shops = _pool(when, cats=cats, area=area, only_open=only_open, known_only=known_only,
+                  categories_ok=lambda c: bool(cats) or c not in NOT_BROWSING)
+    if surprise and len(shops) > n + 3:  # a different set from the one you have now, where possible
+        current = set(route_list())
+        fresh = [c for c in shops if c["name"] not in current]
+        shops = fresh if len(fresh) >= n else shops
+    if len(shops) < 2:
+        st.session_state["rt_msg"] = ("Not enough shops match for that time and place. Try another day or time, "
+                                      "**Anywhere**, fewer kinds of shops, or turn off **Only shops open then**.")
+        return
+    picked = rt.pick_stops(shops, n - (1 if want_food else 0), surprise=surprise)
+    msg = ""
+    if want_food:
+        taken = {c["name"] for c in picked}
+        food = [c for c in _pool(when, cats=[], area="Anywhere", only_open=only_open, known_only=known_only,
+                                 categories_ok=lambda c: c in FOOD_STOPS) if c["name"] not in taken]
+        # Only places a short walk from the route; coffee and bakeries first in the morning.
+        food = [c for c in food if min(rt.miles(c["pt"], p["pt"]) for p in picked) <= 0.35]
+        if when.hour < 16:  # no bars before evening
+            food = [c for c in food if c["category"] != "Bar & Brewery"]
+        morning = when.hour < 11
+        mid = (sum(c["pt"][0] for c in picked) / len(picked), sum(c["pt"][1] for c in picked) / len(picked))
+        food.sort(key=lambda c: (c["open"] != "yes",
+                                 morning and c["category"] not in ("Coffee & Cafe", "Bakery"),
+                                 rt.miles(c["pt"], mid)))
+        if food:
+            picked.append(random.choice(food[:3]) if surprise else food[0])
+        else:
+            msg = "No coffee or food stop is open near these shops then, so the route is all shops."
+    order = rt.walking_order([c["pt"] for c in picked])
+    _route_changed([picked[i]["name"] for i in order])
+    st.session_state["route_new"] = []
+    st.session_state["rt_manual"] = False
+    if len(picked) < n and not msg:
+        msg = f"Only {len(picked)} places match, so that's the route."
+    st.session_state["rt_msg"] = msg
+
+
+def _settle_order():
+    """Put shops added from the cards into walking order. If you've moved stops by hand, new ones
+    slot in where they add the least walking, and your order stays."""
+    new = [n for n in st.session_state.pop("route_new", []) if n in route_list()]
+    if not new:
+        return
+    r = route_list()
+    pts = _coords(r)
+    mapped = [n for n in r if n in pts]
+    if st.session_state.get("rt_manual"):
+        base = [n for n in mapped if n not in new]
+        for n in new:
+            if n not in pts:
+                continue
+            best = min(range(len(base) + 1), key=lambda i: rt.path_length(
+                [pts[x] for x in base[:i] + [n] + base[i:]], list(range(len(base) + 1))))
+            base.insert(best, n)
+        mapped = base
+    else:
+        order = rt.walking_order([pts[n] for n in mapped])
+        mapped = [mapped[i] for i in order]
+    st.session_state["route"] = mapped + [n for n in r if n not in pts]
+
+
+def _move(i: int, d: int):
+    r = route_list()
+    j = i + d
+    if 0 <= j < len(r):
+        r[i], r[j] = r[j], r[i]
+        st.session_state["rt_manual"] = True
+
+
+def _remove(name: str):
+    _route_changed([n for n in route_list() if n != name])
+
+
+def _reverse():
+    st.session_state["route"] = route_list()[::-1]
+
+
+def _tidy():
+    pts = _coords(route_list())
+    mapped = [n for n in route_list() if n in pts]
+    order = rt.walking_order([pts[n] for n in mapped])
+    _route_changed([mapped[i] for i in order] + [n for n in route_list() if n not in pts])
+    st.session_state["rt_manual"] = False
+
+
+def _undo():
+    prev = st.session_state.pop("route_prev", None)
+    if prev is not None:
+        st.session_state["route_prev_redo"] = list(route_list())
+        st.session_state["route"] = prev
+
+
+def _clear():
+    _route_changed([])
+
+
+def route_map(names, pts, extra):
+    stops = [{"lat": pts[n][0], "lon": pts[n][1], "num": str(i + 1), "name": n} for i, n in enumerate(names)]
+    near = [{"lat": p[0], "lon": p[1], "name": n} for n, p in extra]
+    view = pdk.data_utils.compute_view([[s["lon"], s["lat"]] for s in stops] or [[-81.80, 41.478]], 1)
+    view.zoom = min(16, (view.zoom or 14) - 0.7) if len(stops) > 1 else 15.5  # room for phone-width maps
+    layers = [
+        pdk.Layer("ScatterplotLayer", near, get_position="[lon, lat]", get_fill_color=[120, 120, 120, 170],
+                  get_radius=12, radius_min_pixels=5, pickable=True),
+        pdk.Layer("PathLayer", [{"path": [[s["lon"], s["lat"]] for s in stops]}], get_path="path",
+                  get_color=[192, 57, 43, 170], width_min_pixels=3, get_width=4),
+        pdk.Layer("ScatterplotLayer", stops, get_position="[lon, lat]", get_fill_color=[192, 57, 43, 245],
+                  get_radius=20, radius_min_pixels=12, stroked=True, get_line_color=[255, 255, 255],
+                  line_width_min_pixels=2, pickable=True),
+        pdk.Layer("TextLayer", stops, get_position="[lon, lat]", get_text="num", get_size=14, get_color=[255, 255, 255],
+                  font_weight=700, get_text_anchor="'middle'", get_alignment_baseline="'center'"),
+    ]
+    st.pydeck_chart(pdk.Deck(map_style="light", initial_view_state=view, layers=layers,
+                             tooltip={"text": "{name}"}), height=360)
+
+
+def route_builder():
+    with st.container(border=True, key="rt-builder"):
+        st.markdown("#### Let the app pick")
+        st.caption("Picks shops close enough to walk between, with a mix of kinds, in walking order. "
+                   "Tap **Surprise me** as many times as you like for a different route.")
+        st.segmented_control("Where", ["Anywhere", "Madison Ave", "Detroit Ave"], default="Anywhere", key="rt_area")
+        st.slider("How many stops", 3, 10, 6, key="rt_n")
+        with st.expander("More choices"):
+            kinds = sorted(c for c in ALL["category"].unique() if c)
+            st.multiselect("Kinds of places (leave empty for a mix of shops)", kinds, key="rt_cats",
+                           placeholder="A mix of shops")
+            st.toggle("Include a coffee, treat or food stop", value=True, key="rt_food")
+            st.toggle("Only shops open then", value=True, key="rt_open")
+            st.toggle("Skip shops whose hours aren't listed", value=False, key="rt_known")
+        c1, c2 = st.columns(2, gap="small")
+        with c1:
+            surprise = st.button("Surprise me", icon=":material/casino:", type="primary", width="stretch", key="rt_surprise")
+        with c2:
+            best = st.button("Closest together", icon=":material/near_me:", width="stretch", key="rt_best")
+        if surprise or best:
+            build_route(surprise)
+            if route_list():  # on a phone the route is further down: take you to it
+                _html(SCROLL_JS % ".st-key-rt-route-top")
+        if st.session_state.get("rt_msg"):
+            st.info(st.session_state["rt_msg"])
+
+
+def route_page():
+    st.title("🗺️ Plan a shopping route")
+    st.caption("Not sure what you're looking for? Let the app pick a walkable string of shops to wander through, "
+               "or tap **Add to route** on any shop card. Then open it in your maps app and go.")
+    st.html(ROUTE_CSS)
+
+    today = today_local()
+    sbs = rt.small_business_saturday(today.year)
+    now = dt.datetime.now(LOCAL_TZ)
+
+    def day_label(i):
+        d = today + dt.timedelta(days=i)
+        name = "Today" if i == 0 else "Tomorrow" if i == 1 else f"{d:%a} {d:%b} {d.day}"
+        return name + (" 🛍️" if abs((d - sbs).days) <= 1 else "")
+
+    if "rt_day" not in st.session_state:  # evenings default to tomorrow morning
+        st.session_state["rt_day"] = 0 if now.hour < 17 else 1
+        st.session_state["rt_time"] = (min(max(now.hour * 60 + (30 if now.minute < 30 else 60), 9 * 60), 20 * 60)
+                                       if now.hour < 17 else 11 * 60)
+    top_l, top_r = st.columns([2, 3], gap="large")
+    with top_l:
+        _when_picker(day_label, sbs)
+    with top_r:
+        route_builder()
+    _settle_order()
+    _route_body()
+
+
+def _when_picker(day_label, sbs):
+    st.markdown("#### When are you going?")
+    st.pills("Day", list(range(8)), format_func=day_label, key="rt_day", label_visibility="collapsed")
+    st.select_slider("Starting at", list(range(8 * 60, 20 * 60 + 1, 30)), key="rt_time",
+                     format_func=lambda m: _clock(dt.datetime(2000, 1, 1, m // 60, m % 60)))
+    when, started = _when()
+    notes = []
+    if started:
+        notes.append(f"That time has passed, so times below start from now ({_clock(when)}).")
+    if abs((when.date() - sbs).days) <= 1:
+        notes.append("🛍️ Small Business Weekend: many shops have deals (see the Holiday page) and some keep special hours.")
+    if when.date() == sbs - dt.timedelta(days=2):
+        notes.append("It's Thanksgiving: most shops are closed, whatever their usual hours say.")
+    notes.append("Opening times are each shop's usual hours. Holiday hours can differ, so check if it matters.")
+    st.caption(" ".join(notes))
+
+
+def _stops(names, rows, pts, legs, arrive):
+    """The numbered stop cards, with the walk between each."""
+    for i, n in enumerate(names):
+        row = rows.loc[n].copy()
+        row["name"] = n
+        if i:
+            mi = legs[i - 1]
+            if n not in pts or names[i - 1] not in pts:
+                walk = "Walk time unknown (address not on the map)"
+            elif mi < 0.03:
+                walk = "Next door"
+            else:
+                walk = f"{rt.walk_minutes(mi)} min walk · {mi:.1f} mi"
+            st.html(f"<div class='rt-walk'>{walk}</div>")
+        with st.container(border=True, key=f"rt-stop-{i}"):
+            st.html(_stop_head(row, i + 1))
+            st.markdown(f"🕒 Arrive about **{_clock(arrive[i])}** · {_open_line(row, arrive[i])}")
+            if row["hours"]:
+                st.caption(f"Usual hours: {row['hours']}")
+            holiday_lines(n, False)
+            if row["gift_ideas"]:
+                st.markdown(f"🎁 {row['gift_ideas']}")
+            g, a = rt.walk_here_links(n, row["address"])
+            st.markdown(f"📍 {row['address']}  \n🧭 Walk here: [Google Maps]({g}) · [Apple Maps]({a})")
+            with st.container(horizontal=True, key=f"rt-btns-{i}"):
+                st.button("Earlier", icon=":material/arrow_upward:", key=f"rt_up_{i}", on_click=_move, args=(i, -1),
+                          disabled=i == 0)
+                st.button("Later", icon=":material/arrow_downward:", key=f"rt_dn_{i}", on_click=_move, args=(i, 1),
+                          disabled=i == len(names) - 1)
+                st.button("Remove", icon=":material/close:", key=f"rt_rm_{i}", on_click=_remove, args=(n,))
+                if st.button("See shop", icon=":material/open_in_full:", key=f"rt_see_{i}"):
+                    _open_shop_from("dining" if row["category"] in DINING else "shops", slug(n))
+
+
+def _route_body():
+    when, _ = _when()
+    names = route_list()
+    st.query_params["stops"] = ",".join(slug(n) for n in names)
+    if not names:
+        st.query_params.pop("stops", None)
+    with st.container(key="rt-route-top"):
+        st.markdown("#### Your route")
+    if not names:
+        st.info("Your route is empty. Tap **Surprise me** above, or **Add to route** on any shop card.")
+        st.page_link(PAGES["shops"], label="Browse shops", icon=":material/storefront:")
+        if st.session_state.get("route_prev"):
+            st.button("Undo", icon=":material/undo:", on_click=_undo, key="rt_undo_empty")
+        return
+
+    rows = ALL.set_index("name")
+    names = [n for n in names if n in rows.index]
+    pts = _coords(names)
+    mapped = [n for n in names if n in pts]
+    browse = st.session_state.get("rt_browse", 20)
+
+    # Walk the route: arrival time and what each shop is doing then.
+    legs, arrive, t = [], [], when
+    for i, n in enumerate(names):
+        if i:
+            a, b = names[i - 1], n
+            mi = rt.miles(pts[a], pts[b]) if a in pts and b in pts else 0.0
+            legs.append(mi)
+            t += dt.timedelta(minutes=browse + rt.walk_minutes(mi))
+        arrive.append(t)
+    walk_mi = sum(legs)
+    walk_min = sum(rt.walk_minutes(m) for m in legs)
+    done = arrive[-1] + dt.timedelta(minutes=browse)
+    closed = [n for n, a in zip(names, arrive) if rt.status_at(rows.at[n, "hours"], a)["state"] == "closed"]
+
+    # Shops close to the route that aren't on it: easy add-ons.
+    on = set(names)
+    nearby = []
+    if mapped:
+        for c in _pool(when, cats=[], area="Anywhere", only_open=True, known_only=False,
+                       categories_ok=lambda c: c != "Salon & Spa" and (c != "Bar & Brewery" or when.hour >= 16)):
+            if c["name"] in on:
+                continue
+            d, k = min((rt.miles(c["pt"], pts[n]), i) for i, n in enumerate(names) if n in pts)
+            if d <= 0.2:
+                nearby.append((d, k, c))
+        nearby.sort(key=lambda x: (x[2]["open"] != "yes", x[0]))
+
+    # Desktop: map and summary on the left (it stays in view), stops on the right. Phone: one column.
+    left, right = st.columns(2, gap="large")
+    with left, st.container(key="rt-left"):
+        st.html(f"<div class='rt-sum'><b>{len(names)} stop{'s' if len(names) != 1 else ''} · {walk_mi:.1f} miles · "
+                f"about {walk_min} min of walking</b><br>Starting {_clock(when)} with {browse} min at each stop, "
+                f"you'd finish around {_clock(done)}.</div>")
+        if closed:
+            st.warning(f"{', '.join(closed)} {'is' if len(closed) == 1 else 'are'} closed when you'd get there "
+                       "(see below). Try a later start, move stops around, or remove them.", icon=":material/schedule:")
+        links = rt.google_route_links([(n, rows.at[n, "address"]) for n in mapped])
+        for label, url in links:
+            st.link_button("Open walking directions in Google Maps" + (f" ({label})" if len(links) > 1 else ""), url,
+                           icon=":material/directions_walk:", type="primary", width="stretch")
+        st.caption("On a phone this opens the Google Maps app if you have it. For Apple Maps, use **Apple Maps** "
+                   "on each stop to walk to it from wherever you are.")
+        route_map(mapped, pts, [(c["name"], c["pt"]) for _, _, c in nearby])
+        st.caption("Red numbers are your stops (lines are as the crow flies; Google Maps gives street directions). "
+                   "Gray dots are other places open nearby, listed under **Also on the way**.")
+        st.select_slider("Time at each stop", [10, 15, 20, 30, 45, 60], value=20, key="rt_browse",
+                         format_func=lambda m: f"{m} min")
+        with st.container(horizontal=True, key="rt-tools"):
+            st.button("Shortest order", icon=":material/route:", on_click=_tidy, key="rt_tidy")
+            st.button("Reverse", icon=":material/swap_vert:", on_click=_reverse, key="rt_rev")
+            if st.session_state.get("route_prev") is not None:
+                st.button("Undo", icon=":material/undo:", on_click=_undo, key="rt_undo")
+            st.button("Clear route", icon=":material/delete_sweep:", on_click=_clear, key="rt_clear")
+
+    with right:
+        _stops(names, rows, pts, legs, arrive)
+
+    if nearby:
+        st.markdown("#### Also on the way")
+        st.caption("Open then, and within a few minutes' walk of a stop. Add any that catch your eye.")
+        for j in range(0, min(len(nearby), 6), 3):
+            for col, (d, k, c) in zip(st.columns(3), nearby[j:j + 3]):
+                row = rows.loc[c["name"]].copy()
+                row["name"] = c["name"]
+                with col, st.container(border=True, key=f"rt-near-{slug(c['name'])}"):
+                    st.html(_stop_head(row, None))
+                    st.caption(f"{rt.walk_minutes(d)} min from stop {k + 1} · {_open_line(row, when)}")
+                    if row["gift_ideas"]:
+                        st.markdown(f"🎁 {_short(row['gift_ideas'])}")
+                    route_button(c["name"], f"rt-near-add-{slug(c['name'])}")
+    st.caption("Bookmark this page to keep this route: it's saved in the page address.")
 
 
 def _rank(r) -> int:
@@ -869,10 +1341,12 @@ ON_CLOUD = os.path.isdir("/mount/src")
 PAGES = {
     "shops": st.Page(shops_page, title="Shops", icon="🎁", url_path="shops", default=True),
     "dining": st.Page(dining_page, title="Eat & Drink", icon="🍽️", url_path="eat-drink"),
+    "route": st.Page(route_page, title="Plan a route", icon="🗺️", url_path="route"),
     "holiday": st.Page(holiday_page, title="Holiday", icon="🎄", url_path="holiday"),
 }
 pages = list(PAGES.values())
 if not ON_CLOUD:
     pages.append(st.Page(review_page, title="Review photos", icon="🖼️", url_path="review-photos"))
+restore_route()
 st.navigation(pages).run()
 flush_js()

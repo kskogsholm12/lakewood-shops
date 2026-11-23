@@ -72,6 +72,25 @@ For shops with no storefront photo, the app can show a Google Street View image 
 
 Without a key, Street View is skipped and the app works as before.
 
+## Plan a route
+
+The **Plan a route** page helps you explore shops you haven't been to yet, on foot.
+
+- **When are you going?** Pick a day (🛍️ marks Small Business Weekend) and a start time. Every stop shows
+  when you'd get there and whether it's open then, read from the `hours` column. Hours the app can't read,
+  or blank hours, show as "check first".
+- **Let the app pick:** **Surprise me** picks a different walkable cluster each tap; **Closest together**
+  picks the tightest one. Choose Madison, Detroit or anywhere, how many stops, and (under More choices)
+  kinds of places, a coffee/food stop, and whether to skip shops that are closed or have no listed hours.
+  Salons and restaurants are left out of picks unless you choose them (one food stop is added if you want).
+- **Add to route** is on every shop card too. Stops are put in walking order automatically; you can move
+  them, reverse, remove, or undo.
+- **Open walking directions in Google Maps** opens the whole route (Google takes 10 stops per link, so longer
+  routes get one button per leg). Each stop also has Google and Apple Maps links to walk there from where you are.
+- The route is kept in the page address (`/route?stops=...`), so a bookmark keeps it.
+
+Distances are straight lines plus 25% for the street grid, at 3 mph. The route logic is in `route.py`.
+
 ## Holiday info
 
 The **Holiday** page lists upcoming holiday events and Small Business Weekend deals from `data/holiday.csv`.
